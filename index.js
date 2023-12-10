@@ -19,11 +19,22 @@ const io = new Server(server, {
 io.on("connection", (socket) => {
     console.log('user connected:', socket.id);
 
+    socket.on("disconnect", () => {
+        console.log('disconnected', socket.id);
+    })
+    //join a room
+    socket.on("join_room", (data) => {
+        socket.join(data);
+    })
+
     socket.on("send_message", (data) => {
         console.log("data", data);
-        
+
         //send to everyone but yourself
-        socket.broadcast.emit("recieve_message", data)
+        // socket.broadcast.emit("recieve_message", data);
+
+        //send to specific room
+        socket.to(data.room).emit("recieve_messge", data);
     });
 });
 
