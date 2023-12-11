@@ -3,6 +3,7 @@ const app = express();
 const http = require("http");
 const { Server } = require('socket.io');
 const cors = require("cors");
+const md5 = require('md5');
 
 app.use(cors());
 
@@ -15,241 +16,156 @@ const io = new Server(server, {
     }
 })
 
-const online = [];
+const online = {};
 
-const rooms = [];
+const rooms = {};
 
 //runs on conecction
 io.on("connection", (socket) => {
-    console.log('User Connected:', socket.id);
-    //push user to online
-    online.push({id: socket.id, name: '', score: 0});
-    console.log('Online Users', online);
+    //add user socket id to online{}
+    online[socket.id] = {
+        id: socket.id,
+        name: socket.id.substring(0, 5), 
+        score: 0
+    }
 
+    //send user socket info
+    io.to(socket.id).emit("entry", online[socket.id]);
+
+    //disconnect
     socket.on("disconnect", () => {
-        console.log('User Disconnected', socket.id);
-
         //remove user from online users
-        for(let i = 0; i < online.length; i++){
-            if(online[i].id === socket.id){
-                online.splice(i, 1);
-                
-            }
-        }
-
-        console.log('Online Users:', online);
-    })
-
-    //client creates room
-    socket.on("create_room", (data) => {
-        console.log('Create Room:', data);
-
-        //join room
-        socket.join(data.id);
-
-        //get player from online[]
-        let player;
-        for(let i = 0; i < online.length; i++){
-            if(online[i].id === data.id){
-                player = online[i];
-            }
-        }
-
-        const room = { 
-            id: data.id, 
-            players: [player], 
-            chat: [], 
-            dealer: '', 
-            moviesUsed: [], 
-            guesses: [], 
-            critMovie: [],
-            winner: []
-        };
-
-        //update room with player in it
-        io.in(data.id).emit("update_room", room)
-
-        //push room into rooms[]
-        rooms.push(room);
-
-        console.log('Rooms:', rooms)
-
-        //update stage
-        io.to(data.id).emit("stage_update", {stage: 'await'});
-
-        //update notifcation
-        io.to(data.id).emit("notification", {message: 'Room created.'});
-    })
-
-    //client join a room
-    socket.on("join_room", (data) => {
-        console.log('Join Room:', data);
-
-        //join room
-        socket.join(data.room);
-
-        //get player info from online[]
-        let player;
-        for(let i = 0; i < online.length; i++){
-            if(online[i].id === data.id){
-               player = online[i];
-            }
-        }
-
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.room){
-                room = rooms[i];
-            }
-        }
-
-        //push player into room           
-        room.players.push(player);
-
-        //update room
-        io.in(room.id).emit("update_room", room);
-        
-        //update chat
-        io.to(data.room).emit("receive_message", room.chat);
-
-        //update stage
-        io.to(data.id).emit("stage_update", {stage: 'await'});
-
-        //update notifcation
-        io.to(data.id).emit("notification", {message: 'Joined room.'});
+        delete online[socket.id];
     })
 
     //update user name
-    socket.on("update_name", (data) => {
-        for(let i = 0; i < online.length; i++){
-            if(online[i].id === data.id){
-                online[i].name = data.name;
-                io.to(data.id).emit("notification", {message: 'Name updated.'})
-            }
+    socket.on("update_name", ({ id, name }) => {
+        //update name
+        online[id].name = name;
+        //send user socket info
+        io.to(id).emit("entry", online[id]);
+        //send notification
+        io.to(id).emit("notification", {message: 'Name updated.'});
+    })
+
+    //client creates room
+    socket.on("create_room", ({ id }) => {
+        //create room ID
+        const roomID = md5(id);
+        //join room
+        socket.join(roomID);
+        //create room obj
+        const room = { 
+            id: roomID,
+            active: false,
+            host: online[id],
+            players: [online[id]], 
+            chat: [], 
+            dealer: null, 
+            movies: [], 
+            guesses: [], 
+            critMovie: null,
+            winners: []
+        };
+        //add room to rooms{}
+        rooms[roomID] = room;
+        //update room
+        io.in(id).emit("update_room", room)
+        //update stage
+        io.to(id).emit("stage_update", {stage: 'await-players'});
+        //update notifcation
+        io.to(id).emit("notification", {message: 'Room created.'});
+    })
+
+    //client join a room
+    socket.on("join_room", ({ id, room}) => {
+        //if game is not active allow user to join
+        if(!rooms[room].active){
+            //join room
+            socket.join(room);
+
+            //push player into room           
+            rooms[room].players.push(online[id]);
+
+            //update room
+            io.in(room).emit("update_room", rooms[room]);
+
+            //update stage
+            io.to(id).emit("stage_update", {stage: 'await-players'});
+
+            //update notifcation
+            io.to(id).emit("notification", {message: 'Joined room.'});
+        }else{
+            //game is already active
+            io.to(id).emit("notification", {message: 'Game already active.'});
         }
-        console.log('online users:', online);
     })
 
     //send message
-    socket.on("send_message", (data) => {
-        console.log('Send Message:', data)
-
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.room){
-                room = rooms[i];
-            }
+    socket.on("send_message", ({ id, name, message }) => {
+        //push message into room.chat[]
+        rooms[id].chat.push({name, message});
+        //remove old messages
+        if(rooms[id].chat.length > 10){
+            rooms[id].chat.shift();
         }
-        room.chat.push({name: data.name, message: data.message});
-        
-        io.to(data.room).emit("receive_message", room.chat);
+        //update room        
+        io.in(id).emit("update_room", rooms[id]);
     })
 
     //start game
-    socket.on("start_game", (data) => {
-        console.log("Start Game:", data.room);
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.room){
-                room = rooms[i];
-            }
-        }
-
-        //random dealer
-        let random = Math.floor(Math.random() * room.players.length);
-        room.dealer = room.players[random];
-
+    socket.on("start_game", ({ id }) => {
+        //activate game
+        rooms[id].active = true;
+        //assign random dealer
+        let random = Math.floor(Math.random() * rooms[id].players.length);
+        rooms[id].dealer = rooms[id].players[random];
         //update room
-        io.in(room.id).emit("update_room", room);
-
+        io.in(id).emit("update_room", rooms[id]);
         //update stage
-        io.to(room.id).emit("stage_update", {stage: 'assign-movie'});
-        
+        io.in(id).emit("stage_update", {stage: 'assign-movie'});
         //update notifcation
-        io.to(data.id).emit("notification", {message: 'Game started.'});
+        io.in(id).emit("notification", {message: 'Game started.'});
     })
 
     //movie selected
-    socket.on("movie_selected", (data) => {
-        console.log("Movie Selected:", data)
-
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.room.id){
-                room = rooms[i];
-            }
-        }
-
+    socket.on("movie_selected", ({ room, movie }) => {
         //push movie into critMovie[]
-        room.critMovie.push(data.movie);
+        rooms[room].critMovie = movie;
 
-        //push into movieUsed[]
-        room.moviesUsed.push(data.movie);
+        //push into movies[]
+        rooms[room].movies.push(movie);
 
         //update room
-        io.in(room.id).emit("update_room", room);
+        io.in(room).emit("update_room", rooms[room]);
 
         //update stage
-        io.to(room.id).emit("stage_update", {stage: 'cast-vote'});
+        io.in(room).emit("stage_update", {stage: 'cast-vote'});
         
         //update notifcation
-        io.to(data.id).emit("notification", {message: 'Movie selected.'});
+        io.in(room).emit("notification", {message: 'Movie selected.'});
     })
 
     //cast vote
-    socket.on("cast_vote", (data) => {
-        console.log("Cast Vote:", data);
-
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.room.id){
-                room = rooms[i];
-            }
-        }
-
-        //get user
-        let user;
-        for(let i = 0; i < room.players.length; i++){
-            if(room.players[i].id === data.id){
-                user = room.players[i];
-            }
-        }
-
-        //push user and vote into guesses
-        room.guesses.push({player: user, vote: data.vote});
-
+    socket.on("cast_vote", ({ id, room, vote}) => {
+        //push user guess into guesses[]
+        rooms[room].guesses.push({ user: online[id], vote });
         //check if all guesses are cast
-        if(room.guesses.length === room.players.length){
-            console.log('All guesses cast.');
-
+        if(rooms[room].guesses.length === rooms[room].players.length){
             //update room
-            io.in(room.id).emit("update_room", room);
+            io.in(room).emit("update_room", rooms[room]);
 
             //update stage
-            io.to(room.id).emit("stage_update", {stage: 'view-round-results'});
+            io.in(room).emit("stage_update", {stage: 'round-over'});
         
             //update notifcation
-            io.to(room.id).emit("notification", {message: 'Round over.'});
+            io.in(room).emit("notification", {message: 'Round over.'});
         }else{
-            console.log('Awaiting guesses.');
-
             //update stage (private)
-            if(data.id === room.id){
-
-            }else{
-                //update stage
-                io.to(data.id).emit("stage_update", {stage: 'await-guesses'});
+            socket.to(id).emit("stage_update", {stage: 'await-guesses'});
                 
-                //update notifcation
-                io.to(data.id).emit("notification", {message: 'Vote cast.'});
-            }
-            
-            
+            //update notifcation (private)
+            socket.to(id).emit("notification", {message: 'Vote cast.'});
         }
     })
 
