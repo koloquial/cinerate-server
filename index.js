@@ -22,10 +22,8 @@ const rooms = [];
 //runs on conecction
 io.on("connection", (socket) => {
     console.log('User Connected:', socket.id);
-
     //push user to online
-    online.push({id: socket.id, name: ''});
-
+    online.push({id: socket.id, name: '', score: 0});
     console.log('Online Users', online);
 
     socket.on("disconnect", () => {
@@ -57,7 +55,16 @@ io.on("connection", (socket) => {
             }
         }
 
-        const room = { id: data.id, players: [player], chat: [], dealer: [], scores: [] };
+        const room = { 
+            id: data.id, 
+            players: [player], 
+            chat: [], 
+            dealer: '', 
+            moviesUsed: [], 
+            guesses: [], 
+            critMovie: [],
+            winner: []
+        };
 
         //update room with player in it
         io.in(data.id).emit("update_room", room)
@@ -138,6 +145,155 @@ io.on("connection", (socket) => {
         room.chat.push({name: data.name, message: data.message});
         
         io.to(data.room).emit("receive_message", room.chat);
+    })
+
+    //start game
+    socket.on("start_game", (data) => {
+        console.log("Start Game:", data.room);
+        //find room
+        let room;
+        for(let i = 0; i < rooms.length; i++){
+            if(rooms[i].id === data.room){
+                room = rooms[i];
+            }
+        }
+
+        //random dealer
+        let random = Math.floor(Math.random() * room.players.length);
+        room.dealer = room.players[random];
+
+        //update room
+        io.in(room.id).emit("update_room", room);
+
+        //update stage
+        io.to(room.id).emit("stage_update", {stage: 'assign-movie'});
+        
+        //update notifcation
+        io.to(data.id).emit("notification", {message: 'Game started.'});
+    })
+
+    //movie selected
+    socket.on("movie_selected", (data) => {
+        console.log("Movie Selected:", data)
+
+        //find room
+        let room;
+        for(let i = 0; i < rooms.length; i++){
+            if(rooms[i].id === data.room.id){
+                room = rooms[i];
+            }
+        }
+
+        //push movie into critMovie[]
+        room.critMovie.push(data.movie);
+
+        //push into movieUsed[]
+        room.moviesUsed.push(data.movie);
+
+        //update room
+        io.in(room.id).emit("update_room", room);
+
+        //update stage
+        io.to(room.id).emit("stage_update", {stage: 'cast-vote'});
+        
+        //update notifcation
+        io.to(data.id).emit("notification", {message: 'Movie selected.'});
+    })
+
+    //cast vote
+    socket.on("cast_vote", (data) => {
+        console.log("Cast Vote:", data);
+
+        //find room
+        let room;
+        for(let i = 0; i < rooms.length; i++){
+            if(rooms[i].id === data.room.id){
+                room = rooms[i];
+            }
+        }
+
+        //get user
+        let user;
+        for(let i = 0; i < room.players.length; i++){
+            if(room.players[i].id === data.id){
+                user = room.players[i];
+            }
+        }
+
+        //push user and vote into guesses
+        room.guesses.push({player: user, vote: data.vote});
+
+        //check if all guesses are cast
+        if(room.guesses.length === room.players.length){
+            console.log('All guesses cast.');
+
+            //update room
+            io.in(room.id).emit("update_room", room);
+
+            //update stage
+            io.to(room.id).emit("stage_update", {stage: 'view-round-results'});
+        
+            //update notifcation
+            io.to(room.id).emit("notification", {message: 'Round over.'});
+        }else{
+            console.log('Awaiting guesses.');
+
+            //update stage (private)
+            if(data.id === room.id){
+
+            }else{
+                //update stage
+                io.to(data.id).emit("stage_update", {stage: 'await-guesses'});
+                
+                //update notifcation
+                io.to(data.id).emit("notification", {message: 'Vote cast.'});
+            }
+            
+            
+        }
+    })
+
+    //next round
+    socket.on("next_round", (data) => {
+        console.log("Next Round:", data);
+        //find room
+        let room;
+        for(let i = 0; i < rooms.length; i++){
+            if(rooms[i].id === data.id){
+                room = rooms[i];
+            }
+        }
+
+        //assign dealer
+        let target;
+        if(room.winner.length > 1){
+            //random dealer
+            let random = Math.floor(Math.random() * winner.length);
+            target = room.winner[random];
+        }else{
+            target = room.winner;
+        }
+
+        //use target to find player and assign dealer
+        for(let i = 0; i < players.length; i++){
+            if(target.player.id === players[i].id){
+                room.dealer = players[i]
+            }
+        }
+
+        //update room variables
+        room.winner = [];
+        room.guesses = [];
+        room.critMovie = [];
+
+        //update room
+        io.in(room.id).emit("update_room", room);
+
+        //update stage
+        io.to(room.id).emit("stage_update", {stage: 'assign-movie'});
+    
+        //update notifcation
+        io.to(room.id).emit("notification", {message: 'Next round.'});
     })
 });
 
