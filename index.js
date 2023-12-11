@@ -20,6 +20,47 @@ const online = {};
 
 const rooms = {};
 
+function calculateWinner(guesses, target){
+    console.log('calculate winner', guesses, target);
+    const contenders = [];
+    //check if vote is <= target
+    //guesses above are disqualified
+    guesses.forEach(guess => {
+        if(parseFloat(guess.vote) <= parseFloat(target)){
+            contenders.push(guess);
+        }
+    });
+
+    //calculate high vote
+    let high = null;
+    const ties = [];
+    contenders.forEach(contender => {
+        //if high vote hasnt been set
+        if(high === null){
+            high = contender;
+        }else if(parseFloat(contender.vote) > parseFloat(high.vote)){
+            //set new high
+            high = contender;
+        }else if(parseFloat(contender.vote) === parseFloat(high.vote)){
+            //contender is equal to high
+            ties.push(contender);
+        }
+    })
+
+    let result = [];
+    result.push(high);
+    //remove any ties that are lower than high vote
+    ties.forEach(tie => {
+        if(parseFloat(tie) === parseFloat(high.vote)){
+            result.push(tie);
+        }
+    });
+
+    console.log('result', result);
+
+    return result;
+}
+
 //runs on conecction
 io.on("connection", (socket) => {
     //add user socket id to online{}
@@ -152,64 +193,72 @@ io.on("connection", (socket) => {
         rooms[room].guesses.push({ user: online[id], vote });
         //check if all guesses are cast
         if(rooms[room].guesses.length === rooms[room].players.length){
+            //generate an array of winners
+            const winners = calculateWinner(rooms[room].guesses, rooms[room].critMovie.imdbRating);
+            //push winners into rooms[room].winners
+            winners.forEach(winner => {
+                rooms[room].winners.push(winner);
+            })
+            //update scores if winners !== null
+            if(winners[0] !== null){
+                //update scores
+                for(let i = 0; i < winners.length; i++){
+                    for(let j = 0; j < rooms[room].players.length; j++){
+                        if(winners[i].user.id === rooms[room].players[j].id){
+                            rooms[room].players[j].score = rooms[room].players[j].score + 1;
+                        }
+                    }
+                }
+            }
+            
             //update room
             io.in(room).emit("update_room", rooms[room]);
-
             //update stage
             io.in(room).emit("stage_update", {stage: 'round-over'});
-        
             //update notifcation
             io.in(room).emit("notification", {message: 'Round over.'});
         }else{
+            /* PROBLEM:    
             //update stage (private)
-            socket.to(id).emit("stage_update", {stage: 'await-guesses'});
-                
+            // socket.to(id).emit("stage_update", {stage: 'await-guesses'});
+            // stage is set by client as the above line sends to all clients
+             */ 
             //update notifcation (private)
             socket.to(id).emit("notification", {message: 'Vote cast.'});
         }
     })
 
     //next round
-    socket.on("next_round", (data) => {
-        console.log("Next Round:", data);
-        //find room
-        let room;
-        for(let i = 0; i < rooms.length; i++){
-            if(rooms[i].id === data.id){
-                room = rooms[i];
+    socket.on("next_round", ({ room }) => {
+        //if winner !== null
+        if(rooms[room].winners[0] !== null){
+            if(rooms[room].winners.length > 1){
+                //assign random dealer from winners array
+                let random = Math.floor(Math.random() * rooms[room].winners.length);
+                rooms[room].dealer = rooms[room].winners[random].user;
+            }else{
+                //assign dealer to the winner
+                rooms[room].dealer = rooms[room].winners[0].user;
             }
-        }
-
-        //assign dealer
-        let target;
-        if(room.winner.length > 1){
-            //random dealer
-            let random = Math.floor(Math.random() * winner.length);
-            target = room.winner[random];
         }else{
-            target = room.winner;
-        }
-
-        //use target to find player and assign dealer
-        for(let i = 0; i < players.length; i++){
-            if(target.player.id === players[i].id){
-                room.dealer = players[i]
-            }
+            //assign random dealer
+            let random = Math.floor(Math.random() * rooms[room].players.length);
+            rooms[room].dealer = rooms[room].players[random].user;
         }
 
         //update room variables
-        room.winner = [];
-        room.guesses = [];
-        room.critMovie = [];
-
-        //update room
-        io.in(room.id).emit("update_room", room);
+        rooms[room].winners.splice(0, rooms[room].winners.length);
+        rooms[room].guesses.splice(0, rooms[room].guesses.length);
+        rooms[room].critMovie = null;
 
         //update stage
-        io.to(room.id).emit("stage_update", {stage: 'assign-movie'});
-    
+        io.in(room).emit("stage_update", {stage: 'assign-movie'});
+
+        //update room
+        io.in(room).emit("update_room", rooms[room]);
+
         //update notifcation
-        io.to(room.id).emit("notification", {message: 'Next round.'});
+        io.in(room).emit("notification", {message: 'Next round.'});
     })
 });
 
