@@ -21,7 +21,6 @@ const online = {};
 const rooms = {};
 
 function calculateWinner(guesses, target){
-    console.log('calculate winner', guesses, target);
     const contenders = [];
     //check if vote is <= target
     //guesses above are disqualified
@@ -55,9 +54,6 @@ function calculateWinner(guesses, target){
             result.push(tie);
         }
     });
-
-    console.log('result', result);
-
     return result;
 }
 
@@ -69,6 +65,8 @@ io.on("connection", (socket) => {
         name: socket.id.substring(0, 5), 
         score: 0
     }
+
+    console.log('online:', online)
 
     //send user socket info
     io.to(socket.id).emit("entry", online[socket.id]);
@@ -187,6 +185,39 @@ io.on("connection", (socket) => {
         io.in(room).emit("notification", {message: 'Movie selected.'});
     })
 
+    //re-assign dealer
+    socket.on("assign_dealer", ({ room }) => {
+        //update stage
+        io.in(room).emit("stage_update", {stage: 'assign-dealer'});
+
+        //update notifcation
+        io.in(room).emit("notification", {message: 'Dealer time expired.'});
+        
+        setTimeout(() => {
+            //assign random dealer
+            let valid = false;
+            let random;
+            while(!valid){
+                random = Math.floor(Math.random() * rooms[room].players.length);
+                if(rooms[room].players[random].id !== rooms[room].dealer.id){
+                    valid = true;
+                }
+            }
+            rooms[room].dealer = rooms[room].players[random];
+            //update room
+            io.in(room).emit("update_room", rooms[room]);
+
+            //update stage
+            io.in(room).emit("stage_update", {stage: 'assign-movie'});
+
+            //update time
+            io.in(room).emit("update_time", 30);
+
+            //update notifcation
+            io.in(room).emit("notification", {message: 'New dealer.'});
+        }, 3000)
+    })
+
     //cast vote
     socket.on("cast_vote", ({ id, room, vote}) => {
         //push user guess into guesses[]
@@ -243,7 +274,7 @@ io.on("connection", (socket) => {
         }else{
             //assign random dealer
             let random = Math.floor(Math.random() * rooms[room].players.length);
-            rooms[room].dealer = rooms[room].players[random].user;
+            rooms[room].dealer = rooms[room].players[random];
         }
 
         //update room variables
@@ -257,9 +288,23 @@ io.on("connection", (socket) => {
         //update room
         io.in(room).emit("update_room", rooms[room]);
 
+        //update time
+        io.in(room).emit("update_time", 30);
+
         //update notifcation
         io.in(room).emit("notification", {message: 'Next round.'});
+        
     })
+    
+    //game over
+    socket.on("game_over", ({ room }) => {
+        //update stage
+        io.in(room).emit("stage_update", {stage: 'game-over'});
+
+        //update notifcation
+        io.in(room).emit("notification", {message: 'Game over.'});
+    })
+
 });
 
 server.listen(3001, () => {
