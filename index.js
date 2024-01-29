@@ -11,7 +11,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: {
-        origin: ["http://localhost:3000"],
+        origin: ["http://localhost:3002"],
         methods: ["GET", "POST"],
     }
 })
@@ -63,7 +63,8 @@ io.on("connection", (socket) => {
     online[socket.id] = {
         id: socket.id,
         name: socket.id.substring(0, 5), 
-        score: 0
+        score: 0,
+        turns: 0
     }
 
     console.log('online:', online)
@@ -104,7 +105,8 @@ io.on("connection", (socket) => {
             movies: [], 
             guesses: [], 
             critMovie: null,
-            winners: []
+            winners: [],
+            dealerRotation: []
         };
         //add room to rooms{}
         rooms[roomID] = room;
@@ -159,6 +161,8 @@ io.on("connection", (socket) => {
         //assign random dealer
         let random = Math.floor(Math.random() * rooms[id].players.length);
         rooms[id].dealer = rooms[id].players[random];
+        //increment turns dealt
+        rooms[id].players[random].turns = rooms[id].players[random].turns + 1;
         //update room
         io.in(id).emit("update_room", rooms[id]);
         //update stage
@@ -192,18 +196,41 @@ io.on("connection", (socket) => {
 
         //update notifcation
         io.in(room).emit("notification", {message: 'Dealer time expired.'});
+
+        //add additional turn to player who forfeitted
+        for(let i = 0; i < rooms[room].players.length; i++){
+            if(rooms[room].dealer.id === rooms[room].players[i].id){
+                rooms[room].players[i].turns = rooms[room].players[i].turns + 1;
+                break;
+            }
+        }
         
         setTimeout(() => {
-            //assign random dealer
-            let valid = false;
-            let random;
-            while(!valid){
-                random = Math.floor(Math.random() * rooms[room].players.length);
-                if(rooms[room].players[random].id !== rooms[room].dealer.id){
-                    valid = true;
-                }
+        //assign random dealer
+        let low = null;
+        let iteration;
+        //iterate over players
+        for(let i = 0; i < rooms[room].players.length; i++){
+            //get lowest amount of turns
+            if(!low){
+                //if low is not set, set it
+                low = rooms[room].players[i]
+                console.log('LOW', low)
+                iteration = i;
+            }else if(low.turns > rooms[room].players[i].turns){
+                //found new low
+                low = rooms[room].players[i];
+                iteration = i;
             }
-            rooms[room].dealer = rooms[room].players[random];
+        }
+        //increment turn
+        rooms[room].players[iteration].turns = rooms[room].players[iteration].turns + 1;
+
+        //assign dealer to lowest turns
+        rooms[room].dealer = low;
+
+        console.log('NEW DEALER', rooms[room].dealer);
+            
             //update room
             io.in(room).emit("update_room", rooms[room]);
 
@@ -261,39 +288,68 @@ io.on("connection", (socket) => {
 
     //next round
     socket.on("next_round", ({ room }) => {
-        //if winner !== null
-        if(rooms[room].winners[0] !== null){
-            if(rooms[room].winners.length > 1){
-                //assign random dealer from winners array
-                let random = Math.floor(Math.random() * rooms[room].winners.length);
-                rooms[room].dealer = rooms[room].winners[random].user;
+        /* 
+            ASSIGN DEALER TO WINNER OF ROUND
+            ASSIGN RANDOM IF NO WINNER OF ROUND
+
+            if winner !== null
+            if(rooms[room].winners[0] !== null){
+                if(rooms[room].winners.length > 1){
+                    //assign random dealer from winners array
+                    let random = Math.floor(Math.random() * rooms[room].winners.length);
+                    rooms[room].dealer = rooms[room].winners[random].user;
+                }else{
+                    //assign dealer to the winner
+                    rooms[room].dealer = rooms[room].winners[0].user;
+                }
             }else{
-                //assign dealer to the winner
-                rooms[room].dealer = rooms[room].winners[0].user;
+                //assign random dealer
+                let random = Math.floor(Math.random() * rooms[room].players.length);
+                rooms[room].dealer = rooms[room].players[random];
             }
-        }else{
-            //assign random dealer
-            let random = Math.floor(Math.random() * rooms[room].players.length);
-            rooms[room].dealer = rooms[room].players[random];
+        */
+
+        //assign random dealer
+        let low = null;
+        let iteration;
+        //iterate over players
+        for(let i = 0; i < rooms[room].players.length; i++){
+            //get lowest amount of turns
+            if(!low){
+                //if low is not set, set it
+                low = rooms[room].players[i]
+                console.log('LOW', low)
+                iteration = i;
+            }else if(low.turns > rooms[room].players[i].turns){
+                //found new low
+                low = rooms[room].players[i];
+                iteration = i;
+            }
         }
+        //increment turn
+        rooms[room].players[iteration].turns = rooms[room].players[iteration].turns + 1;
+
+        //assign dealer to lowest turns
+        rooms[room].dealer = low;
+
+        console.log('NEW DEALER', rooms[room].dealer);
 
         //update room variables
         rooms[room].winners.splice(0, rooms[room].winners.length);
         rooms[room].guesses.splice(0, rooms[room].guesses.length);
         rooms[room].critMovie = null;
 
-        //update stage
-        io.in(room).emit("stage_update", {stage: 'assign-movie'});
-
         //update room
         io.in(room).emit("update_room", rooms[room]);
+
+        //update stage
+        io.in(room).emit("stage_update", {stage: 'assign-movie'});
 
         //update time
         io.in(room).emit("update_time", 30);
 
         //update notifcation
         io.in(room).emit("notification", {message: 'Next round.'});
-        
     })
     
     //game over
