@@ -27,6 +27,33 @@ app.use(
   })
 );
 
+// Basic landing page that shows a message and redirects to the web app
+app.get("/", (_req, res) => {
+  const target = "https://cinerate.onrender.com";
+  res
+    .status(200)
+    .type("html")
+    .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>CineRate server</title>
+  <meta http-equiv="refresh" content="1; url=${target}">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 2rem; }
+    a { text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>CineRate server running</h1>
+  <p>Redirecting to the app… If you’re not redirected, <a href="${target}">click here</a>.</p>
+  <script>setTimeout(() => location.replace("${target}"), 1000);</script>
+</body>
+</html>`);
+});
+
+
 app.use("/music", express.static(path.join(__dirname, "music")));
 
 const server = http.createServer(app);
