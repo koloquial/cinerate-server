@@ -1,0 +1,5 @@
+/node_modules
+.env
+/music
+/server/music/*.mp3
+/server/music/*.wav
