@@ -32,6 +32,22 @@ const RoundSchema = new mongoose.Schema({
   poster: String,         // url (optional)
   imdbRating: Number,     // 0..100 (we convert from 0..10 * 10)
 
+  genre: String,
+  plot: String,
+  runtime: String,
+  rated: String,
+  released: String,
+  language: String,
+  country: String,
+  director: String,
+  writer: String,
+  actors: String,
+  awards: String,
+  boxOffice: String,
+  production: String,
+  imdbVotes: String,
+
+
   guesses: { type: [GuessSchema], default: [] },
   winnerUid: String,
   winnerName: String,
@@ -49,7 +65,7 @@ const GameSchema = new mongoose.Schema(
 
     maxPlayers: { type: Number, default: 4, min: 2, max: 10 },
     players: { type: [PlayerSchema], default: [] },
-
+    playAgainUids: { type: [String], default: [] },
     state: {
       type: String,
       enum: ["waiting", "picking", "guessing", "revealing", "finished"],
@@ -58,8 +74,19 @@ const GameSchema = new mongoose.Schema(
 
     usedOmdbIds: { type: [String], default: [] }, // prevent repeats
     rounds: { type: [RoundSchema], default: [] },
-
     targetScore: { type: Number, default: 5 }, // first to 5
+
+    result: {
+      type: {
+        winnerUid: String,
+        winnerName: String,
+        score: Number,
+        avgDelta: Number,
+        finishedAt: Date,
+      },
+      default: null,
+    },
+
   },
   { timestamps: true }
 );

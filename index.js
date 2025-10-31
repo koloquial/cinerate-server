@@ -142,6 +142,11 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+
+
+
+
+
 // GET /metrics  -> { onlineUsers, omdbRemaining }
 app.get("/metrics", (req, res) => {
   res.json({
@@ -426,6 +431,8 @@ async function broadcastRoom(roomId) {
     targetScore: game.targetScore,
     usedOmdbIds: game.usedOmdbIds || [],
     endsAt: t.endsAtMs || null,
+    playAgainCount: (game.playAgainUids || []).length,
+    playAgainUids: game.playAgainUids || [],
     result, // 👈 NEW: only meaningful when finished
   });
 }
@@ -697,10 +704,33 @@ async function awardWinAndFinish(game, winnerUid) {
       { upsert: true }
     );
   }
+
+  // Compute winner's avg delta for THIS game only
+  let sum = 0, n = 0;
+  for (const r of game.rounds || []) {
+    for (const g of r.guesses || []) {
+      if (g.uid === winnerUid && Number.isFinite(Number(r.imdbRating)) && Number.isFinite(Number(g.value))) {
+        sum += Math.abs(Number(r.imdbRating) - Number(g.value));
+        n += 1;
+      }
+    }
+  }
+  const avgDelta = n > 0 ? Number((sum / n).toFixed(2)) : null;
+
+  game.result = {
+    winnerUid,
+    winnerName: winner ? winner.displayName : "—",
+    score: winner ? (winner.score || 0) : 0,
+    avgDelta,
+    finishedAt: new Date(),
+  };
+
   game.state = "finished";
+  game.playAgainUids = [];  // reset votes on finish
   await game.save();
   await broadcastRoom(game.roomId);
 }
+
 
 async function nextRoundOrFinish(roomId) {
   clearTimers(roomId);
@@ -730,8 +760,11 @@ io.on("connection", (socket) => {
   socket.on("auth:hello", async ({ idToken }, cb) => {
     try {
       const decoded = await admin.auth().verifyIdToken(idToken);
-      const displayName = nameFromDecoded(decoded);
+      // const displayName = nameFromDecoded(decoded);
       const uid = decoded.uid;
+      // Prefer claimed name in UserStat; fallback to first token from provider
+      const u = await UserStat.findOne({ uid }).select("displayName").lean();
+      const displayName = u?.displayName || nameFromDecoded(decoded);
       socketState.set(socket.id, { uid, displayName, roomId: null, lastMsgAt: 0 });
 
       onlineUids.add(uid);
@@ -832,6 +865,59 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Player votes to play again (only when game is finished)
+  socket.on("game:play_again", async (cb) => {
+    try {
+      const s = socketState.get(socket.id);
+      if (!s?.roomId) throw new Error("Not in a room");
+      const game = await getGame(s.roomId);
+      if (!game) throw new Error("Room not found");
+      if (game.state !== "finished") throw new Error("Game not finished");
+
+      game.playAgainUids = game.playAgainUids || [];
+      if (!game.playAgainUids.includes(s.uid)) {
+        game.playAgainUids.push(s.uid);
+        await game.save();
+      }
+      await broadcastRoom(game.roomId);
+      cb?.({ ok: true, count: game.playAgainUids.length });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  // Host restarts a new game if enough votes (>= 2) and at least 2 players
+  socket.on("game:restart", async (cb) => {
+    try {
+      const s = socketState.get(socket.id);
+      if (!s?.roomId) throw new Error("Not in a room");
+      const game = await getGame(s.roomId);
+      if (!game) throw new Error("Room not found");
+      if (game.state !== "finished") throw new Error("Game not finished");
+      if (game.hostUid !== s.uid) throw new Error("Only host can start");
+      if ((game.playAgainUids || []).length < 2) throw new Error("Need at least 2 votes");
+      if (game.players.length < 2) throw new Error("Need at least 2 players");
+
+      // Reset round state & scores; keep same players/host/roomId
+      game.players.forEach((p) => (p.score = 0));
+      game.usedOmdbIds = [];
+      game.rounds = [];
+      game.playAgainUids = [];
+      game.result = null;
+      game.state = "waiting";
+      await game.save();
+
+      // Immediately move to picking phase (like starting a new game)
+      await startPickingPhase(game.roomId);
+
+      cb?.({ ok: true });
+      await emitPublicRefresh(); // remains out of public list because game started
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+
   // Leave a room (ATOMIC)
   socket.on("room:leave", async (_, cb) => {
     try {
@@ -925,6 +1011,8 @@ io.on("connection", (socket) => {
       game.players.forEach((p) => (p.score = 0));
       game.usedOmdbIds = [];
       game.rounds = [];
+      game.playAgainUids = [];
+      game.result = null;
       await game.save();
 
       await startPickingPhase(game.roomId);
@@ -981,6 +1069,21 @@ io.on("connection", (socket) => {
       round.year = data.Year || "";
       round.poster = data.Poster || "";
       round.imdbRating = imdbDec; // store DECIMAL 0..10
+      round.genre = data.Genre || "";
+      round.plot = data.Plot || "";
+      round.runtime = data.Runtime || "";
+      round.rated = data.Rated || "";
+      round.released = data.Released || "";
+      round.language = data.Language || "";
+      round.country = data.Country || "";
+      round.director = data.Director || "";
+      round.writer = data.Writer || "";
+      round.actors = data.Actors || "";
+      round.awards = data.Awards || "";
+      round.boxOffice = data.BoxOffice || "";
+      round.production = data.Production || "";
+      round.imdbVotes = data.imdbVotes || "";
+
 
       game.usedOmdbIds.push(omdbId);
       await game.save();
@@ -1048,6 +1151,9 @@ io.on("connection", (socket) => {
       // Loss if they had guessed this game and it's not waiting
       try {
         const g = await Game.findOne({ roomId }).lean();
+        if (Array.isArray(game.playAgainUids)) {
+          game.playAgainUids = game.playAgainUids.filter((u) => u !== uid);
+        }
         if (g && g.state !== "waiting" && userHasGuessedInGame(g, uid)) {
           await UserStat.findOneAndUpdate(
             { uid },
