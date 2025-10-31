@@ -1,6 +1,3 @@
-// server/index.js
-// Express + Socket.IO + MongoDB server for CineRate
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -52,7 +49,6 @@ app.get("/", (_req, res) => {
 </body>
 </html>`);
 });
-
 
 app.use("/music", express.static(path.join(__dirname, "music")));
 
@@ -137,15 +133,44 @@ mongoose.connection.on("disconnected", () => {
   console.warn("Mongo disconnected");
 });
 
+/* ---------------- Helpers ---------------- */
+function ms(n) {
+  return n;
+}
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function normalizeName(raw) {
+  let s = String(raw || "").trim().replace(/\s+/g, " ");
+  return s;
+}
+async function isDisplayNameAvailable(name, excludeUid = null) {
+  if (!name) return false;
+  const rx = new RegExp(`^${escapeRegExp(name)}$`, "i");
+  const q = excludeUid ? { displayName: rx, uid: { $ne: excludeUid } } : { displayName: rx };
+  const existing = await UserStat.findOne(q).select("_id uid").lean();
+  return !existing;
+}
+async function broadcastUserRooms(uid) {
+  for (const [sid, s] of socketState.entries()) {
+    if (s?.uid === uid && s.roomId) {
+      await broadcastRoom(s.roomId);
+    }
+  }
+}
+function nameFromDecoded(decoded) {
+  const raw =
+    decoded.name ||
+    decoded.displayName ||
+    (decoded.email ? decoded.email.split("@")[0] : "");
+  if (!raw) return `Player_${decoded.uid.slice(0, 6)}`;
+  return String(raw).trim().split(/\s+/)[0]; // first token
+}
+
 /* ---------------- REST ---------------- */
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
-
-
-
-
-
 
 // GET /metrics  -> { onlineUsers, omdbRemaining }
 app.get("/metrics", (req, res) => {
@@ -212,6 +237,127 @@ app.get("/stats/history", async (req, res) => {
     res.json({ items: list });
   } catch (e) {
     res.status(401).json({ error: "Unauthorized" });
+  }
+});
+
+/* ---------------- Display name: existing route (kept) ---------------- */
+// POST /profile/claim-name  (Authorization: Bearer <idToken>)
+app.post("/profile/claim-name", async (req, res) => {
+  try {
+    const decoded = await verifyBearer(req);
+    const uid = decoded.uid;
+
+    let raw = normalizeName(req.body?.displayName || "");
+
+    // Validate
+    if (!raw) return res.status(400).json({ error: "Display name required" });
+    if (raw.length < 2 || raw.length > 30) {
+      return res.status(400).json({ error: "Display name must be 2–30 characters" });
+    }
+    if (!/^[A-Za-z0-9 _-]+$/.test(raw)) {
+      return res.status(400).json({ error: "Only letters, numbers, spaces, _ and - are allowed" });
+    }
+
+    // Uniqueness check (case-insensitive) against other users
+    if (!(await isDisplayNameAvailable(raw, uid))) {
+      return res.status(409).json({ error: "That display name is already taken" });
+    }
+
+    // Update Firebase Auth profile
+    await admin.auth().updateUser(uid, { displayName: raw });
+
+    // Upsert into UserStat
+    await UserStat.findOneAndUpdate(
+      { uid },
+      { $set: { displayName: raw } },
+      { upsert: true, new: true }
+    );
+
+    // Update any live games where this user appears (player list + hostName if hosting)
+    await Game.updateMany(
+      { "players.uid": uid },
+      { $set: { "players.$[p].displayName": raw } },
+      { arrayFilters: [{ "p.uid": uid }] }
+    );
+    await Game.updateMany({ hostUid: uid }, { $set: { hostName: raw } });
+
+    // Update in-memory socket state
+    for (const [sid, s] of socketState.entries()) {
+      if (s?.uid === uid) socketState.set(sid, { ...s, displayName: raw });
+    }
+
+    await broadcastUserRooms(uid);
+    return res.json({ ok: true, displayName: raw });
+  } catch (e) {
+    console.error("claim-name error:", e?.message || e);
+    if (/auth/i.test(String(e))) return res.status(401).json({ error: "Unauthorized" });
+    return res.status(400).json({ error: e?.message || "Name update failed" });
+  }
+});
+
+/* ---------------- Display name: endpoints your client expects ---------------- */
+// GET /display-name/check?name=Nick  -> { available: boolean }
+app.get("/display-name/check", async (req, res) => {
+  try {
+    const name = normalizeName(req.query?.name || "");
+    if (!name) return res.json({ available: false });
+
+    // If caller is authenticated, exclude their own uid from uniqueness checks
+    let excludeUid = null;
+    try {
+      const decoded = await verifyBearer(req);
+      excludeUid = decoded.uid;
+    } catch (_) { }
+
+    const available = await isDisplayNameAvailable(name, excludeUid);
+    res.json({ available });
+  } catch (e) {
+    res.json({ available: false });
+  }
+});
+
+// POST /display-name/update  (Authorization: Bearer <idToken>) { displayName }
+app.post("/display-name/update", async (req, res) => {
+  try {
+    const decoded = await verifyBearer(req);
+    const uid = decoded.uid;
+
+    let raw = normalizeName(req.body?.displayName || "");
+    if (!raw) return res.status(400).json({ error: "Display name required" });
+    if (raw.length < 2 || raw.length > 30) {
+      return res.status(400).json({ error: "Display name must be 2–30 characters" });
+    }
+    if (!/^[A-Za-z0-9 _-]+$/.test(raw)) {
+      return res.status(400).json({ error: "Only letters, numbers, spaces, _ and - are allowed" });
+    }
+    if (!(await isDisplayNameAvailable(raw, uid))) {
+      return res.status(409).json({ error: "That display name is already taken" });
+    }
+
+    // Update Firebase & DB just like claim-name
+    await admin.auth().updateUser(uid, { displayName: raw });
+    await UserStat.findOneAndUpdate(
+      { uid },
+      { $set: { displayName: raw } },
+      { upsert: true, new: true }
+    );
+    await Game.updateMany(
+      { "players.uid": uid },
+      { $set: { "players.$[p].displayName": raw } },
+      { arrayFilters: [{ "p.uid": uid }] }
+    );
+    await Game.updateMany({ hostUid: uid }, { $set: { hostName: raw } });
+
+    for (const [sid, s] of socketState.entries()) {
+      if (s?.uid === uid) socketState.set(sid, { ...s, displayName: raw });
+    }
+    await broadcastUserRooms(uid);
+
+    return res.json({ ok: true, displayName: raw });
+  } catch (e) {
+    console.error("display-name:update error:", e?.message || e);
+    if (/auth/i.test(String(e))) return res.status(401).json({ error: "Unauthorized" });
+    return res.status(400).json({ error: e?.message || "Update failed" });
   }
 });
 
@@ -365,28 +511,14 @@ const socketState = new Map(); // socket.id -> { uid, displayName, roomId, lastM
 const timers = {}; // roomId -> { pickTimer, guessTimer, revealTimer, endsAtMs }
 const cooldowns = new Map(); // socket.id -> { lastStartAt: 0, lastPickAt: 0 }
 
-/* ---------------- helpers ---------------- */
-function ms(n) {
-  return n;
-}
-
-function nameFromDecoded(decoded) {
-  const raw =
-    decoded.name ||
-    decoded.displayName ||
-    (decoded.email ? decoded.email.split("@")[0] : "");
-  if (!raw) return `Player_${decoded.uid.slice(0, 6)}`;
-  return String(raw).trim().split(/\s+/)[0]; // first token
-}
-
+/* ---------------- Game broadcast ---------------- */
 async function broadcastRoom(roomId) {
   const game = await Game.findOne({ roomId }).lean();
   if (!game) return;
 
-  // Compute a game-over summary when finished
-  let result = null;
-  if (game.state === "finished") {
-    // pick highest score (if multiple, first in list wins as tiebreaker)
+  // Prefer stored result; compute if absent and finished
+  let result = game.result || null;
+  if (!result && game.state === "finished") {
     const playersSorted = [...(game.players || [])].sort(
       (a, b) => (b.score || 0) - (a.score || 0)
     );
@@ -408,7 +540,7 @@ async function broadcastRoom(roomId) {
         winnerUid: top.uid,
         winnerName: top.displayName,
         score: top.score || 0,
-        avgDelta, // winner's average delta in this game
+        avgDelta,
       };
     }
   }
@@ -433,10 +565,9 @@ async function broadcastRoom(roomId) {
     endsAt: t.endsAtMs || null,
     playAgainCount: (game.playAgainUids || []).length,
     playAgainUids: game.playAgainUids || [],
-    result, // 👈 NEW: only meaningful when finished
+    result,
   });
 }
-
 
 // Notify all dashboards to refresh public games
 async function emitPublicRefresh() {
@@ -458,7 +589,6 @@ async function getGame(roomId) {
 
 // --- Atomic helpers to avoid VersionError on concurrent updates ---
 async function removePlayerAndRehost(roomId, uid) {
-  // Pull player atomically; get the updated doc back
   const game = await Game.findOneAndUpdate(
     { roomId },
     { $pull: { players: { uid } } },
@@ -466,14 +596,12 @@ async function removePlayerAndRehost(roomId, uid) {
   );
   if (!game) return;
 
-  // If room empty, clean up
   if (game.players.length === 0) {
     clearTimers(roomId);
     await Game.deleteOne({ _id: game._id });
     return;
   }
 
-  // If host left, promote first remaining player
   if (game.hostUid === uid) {
     const next = game.players[0];
     await Game.updateOne(
@@ -482,7 +610,6 @@ async function removePlayerAndRehost(roomId, uid) {
     );
   }
 
-  // If only one player remains during an active game → end and award win
   if (game.players.length === 1 && game.state !== "waiting") {
     const fresh = await Game.findOne({ _id: game._id });
     await awardWinAndFinish(fresh, game.players[0].uid);
@@ -517,9 +644,8 @@ async function startPickingPhase(roomId) {
   clearTimers(roomId);
   const game = await getGame(roomId);
   if (!game) return;
-  if (game.players.length < 2) return; // safety
+  if (game.players.length < 2) return;
 
-  // Picker rotates with round index
   const idx = game.rounds.length % game.players.length;
   const picker = game.players[idx];
 
@@ -544,7 +670,6 @@ async function startPickingPhase(roomId) {
 }
 
 async function forceSkipPicking(roomId) {
-  // Time ran out selecting a movie → advance to next picker (do NOT retry same user)
   const game = await getGame(roomId);
   if (!game || game.state !== "picking") return;
 
@@ -588,7 +713,6 @@ async function revealPhase(roomId) {
     return { ...obj, value: Number(obj.value) };
   });
 
-  // Debug log for visibility
   console.log("[REVEAL]", {
     roomId,
     title: round.title,
@@ -608,11 +732,8 @@ async function revealPhase(roomId) {
   let winner = null;
   let tieWinners = [];
   if (valid.length > 0) {
-    // Compute deltas
     const withDelta = valid.map((g) => ({ ...g, delta: Math.abs(actual - g.value) }));
-    // Find minimal delta
     const minDelta = Math.min(...withDelta.map((g) => g.delta));
-    // Floating-point safe equality check
     const EPS = 1e-9;
     tieWinners = withDelta.filter((g) => Math.abs(g.delta - minDelta) <= EPS);
 
@@ -622,7 +743,6 @@ async function revealPhase(roomId) {
   }
 
   if (winner) {
-    // Single winner → award point
     round.winnerUid = winner.uid;
     round.winnerName = winner.displayName;
     round.winnerDelta = winner.delta ?? Math.abs(actual - winner.value);
@@ -634,7 +754,6 @@ async function revealPhase(roomId) {
     round.tiedUids = [];
     round.tiedNames = [];
   } else if (tieWinners.length >= 2) {
-    // Tie at the top → NO points awarded
     round.winnerUid = undefined;
     round.winnerName = undefined;
     round.winnerDelta = undefined;
@@ -643,7 +762,6 @@ async function revealPhase(roomId) {
     round.tiedNames = tieWinners.map((t) => t.displayName);
     console.log("[REVEAL] Tie at top; no points awarded.", round.tiedNames);
   } else {
-    // Nobody valid (everyone over or no guesses)
     round.winnerUid = undefined;
     round.winnerName = undefined;
     round.winnerDelta = undefined;
@@ -655,7 +773,6 @@ async function revealPhase(roomId) {
 
   await game.save();
 
-  // Persist per-user guess stats (decimal)
   await persistUserStatsForRound(game, round, actual);
 
   game.state = "revealing";
@@ -667,7 +784,6 @@ async function revealPhase(roomId) {
   timers[roomId].endsAtMs = Date.now() + ms(10_000);
   timers[roomId].revealTimer = setTimeout(() => nextRoundOrFinish(roomId), ms(10_000));
 }
-
 
 async function persistUserStatsForRound(game, round, actual) {
   const roomId = game.roomId;
@@ -683,8 +799,8 @@ async function persistUserStatsForRound(game, round, actual) {
             roomId,
             omdbId: round.omdbId,
             title: round.title,
-            actual, // decimal
-            guess: g.value, // decimal
+            actual,
+            guess: g.value,
             delta,
             createdAt: new Date(),
           },
@@ -709,7 +825,11 @@ async function awardWinAndFinish(game, winnerUid) {
   let sum = 0, n = 0;
   for (const r of game.rounds || []) {
     for (const g of r.guesses || []) {
-      if (g.uid === winnerUid && Number.isFinite(Number(r.imdbRating)) && Number.isFinite(Number(g.value))) {
+      if (
+        g.uid === winnerUid &&
+        Number.isFinite(Number(r.imdbRating)) &&
+        Number.isFinite(Number(g.value))
+      ) {
         sum += Math.abs(Number(r.imdbRating) - Number(g.value));
         n += 1;
       }
@@ -726,18 +846,16 @@ async function awardWinAndFinish(game, winnerUid) {
   };
 
   game.state = "finished";
-  game.playAgainUids = [];  // reset votes on finish
+  game.playAgainUids = []; // reset votes on finish
   await game.save();
   await broadcastRoom(game.roomId);
 }
-
 
 async function nextRoundOrFinish(roomId) {
   clearTimers(roomId);
   const game = await getGame(roomId);
   if (!game) return;
 
-  // If only one player remains mid-game, immediately end and award win.
   if (game.players.length === 1 && game.state !== "waiting") {
     await awardWinAndFinish(game, game.players[0].uid);
     return;
@@ -760,7 +878,6 @@ io.on("connection", (socket) => {
   socket.on("auth:hello", async ({ idToken }, cb) => {
     try {
       const decoded = await admin.auth().verifyIdToken(idToken);
-      // const displayName = nameFromDecoded(decoded);
       const uid = decoded.uid;
       // Prefer claimed name in UserStat; fallback to first token from provider
       const u = await UserStat.findOne({ uid }).select("displayName").lean();
@@ -768,7 +885,7 @@ io.on("connection", (socket) => {
       socketState.set(socket.id, { uid, displayName, roomId: null, lastMsgAt: 0 });
 
       onlineUids.add(uid);
-      emitMetrics(); // push updated online count
+      emitMetrics();
 
       cb?.({ ok: true, uid, displayName });
     } catch (e) {
@@ -786,7 +903,7 @@ io.on("connection", (socket) => {
       const game = new Game({
         roomId,
         hostUid: s.uid,
-        hostName: s.displayName, // display only
+        hostName: s.displayName,
         isPrivate: !!isPrivate,
         maxPlayers: Math.max(2, Math.min(10, Number(maxPlayers) || 4)),
         players: [{ uid: s.uid, displayName: s.displayName, score: 0 }],
@@ -859,7 +976,7 @@ io.on("connection", (socket) => {
 
       cb?.({ ok: true });
       await broadcastRoom(roomId);
-      await emitPublicRefresh(); // player count changed
+      await emitPublicRefresh();
     } catch (e) {
       cb?.({ ok: false, error: e.message });
     }
@@ -898,7 +1015,6 @@ io.on("connection", (socket) => {
       if ((game.playAgainUids || []).length < 2) throw new Error("Need at least 2 votes");
       if (game.players.length < 2) throw new Error("Need at least 2 players");
 
-      // Reset round state & scores; keep same players/host/roomId
       game.players.forEach((p) => (p.score = 0));
       game.usedOmdbIds = [];
       game.rounds = [];
@@ -907,16 +1023,14 @@ io.on("connection", (socket) => {
       game.state = "waiting";
       await game.save();
 
-      // Immediately move to picking phase (like starting a new game)
       await startPickingPhase(game.roomId);
 
       cb?.({ ok: true });
-      await emitPublicRefresh(); // remains out of public list because game started
+      await emitPublicRefresh();
     } catch (e) {
       cb?.({ ok: false, error: e.message });
     }
   });
-
 
   // Leave a room (ATOMIC)
   socket.on("room:leave", async (_, cb) => {
@@ -963,7 +1077,6 @@ io.on("connection", (socket) => {
 
       const roomId = s.roomId;
       const game = await Game.findOne({ roomId });
-      if (!game) throw new Error("Room not found");
       if (game.state === "finished") throw new Error("Chat closed");
 
       const msg = {
@@ -1017,13 +1130,13 @@ io.on("connection", (socket) => {
 
       await startPickingPhase(game.roomId);
       cb?.({ ok: true });
-      await emitPublicRefresh(); // leaves public list
+      await emitPublicRefresh();
     } catch (e) {
       cb?.({ ok: false, error: e.message });
     }
   });
 
-  // Picker selects a movie by OMDb ID (store decimal rating)
+  // Picker selects a movie by OMDb ID (store decimal rating + rich fields)
   socket.on("round:pick_movie", async ({ omdbId }, cb) => {
     try {
       const s = socketState.get(socket.id);
@@ -1052,8 +1165,8 @@ io.on("connection", (socket) => {
       const data = await resp.json();
       if (data.Response === "False") throw new Error("OMDb not found");
 
-      incOmdbCount(1); // count a detail call
-      const imdbDec = Number(data.imdbRating); // decimal like 8.1
+      incOmdbCount(1);
+      const imdbDec = Number(data.imdbRating);
       if (isNaN(imdbDec)) throw new Error("No IMDb rating for this title");
 
       console.log("[PICK]", {
@@ -1068,7 +1181,7 @@ io.on("connection", (socket) => {
       round.title = data.Title || "Unknown";
       round.year = data.Year || "";
       round.poster = data.Poster || "";
-      round.imdbRating = imdbDec; // store DECIMAL 0..10
+      round.imdbRating = imdbDec;
       round.genre = data.Genre || "";
       round.plot = data.Plot || "";
       round.runtime = data.Runtime || "";
@@ -1084,7 +1197,6 @@ io.on("connection", (socket) => {
       round.production = data.Production || "";
       round.imdbVotes = data.imdbVotes || "";
 
-
       game.usedOmdbIds.push(omdbId);
       await game.save();
 
@@ -1095,7 +1207,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Players submit guesses (0..10, step 0.1) — one per player (picker CAN guess)
+  // Players submit guesses (0..10, step 0.1)
   socket.on("round:guess", async ({ value }, cb) => {
     try {
       const s = socketState.get(socket.id);
@@ -1120,7 +1232,6 @@ io.on("connection", (socket) => {
       });
       await game.save();
 
-      // If all players (INCLUDING picker) have guessed, reveal early
       const guessersCount = game.players.length;
       const uniqueGuessers = new Set(round.guesses.map((g) => g.uid)).size;
       if (uniqueGuessers >= guessersCount) {
@@ -1148,18 +1259,21 @@ io.on("connection", (socket) => {
     const { uid, roomId } = s;
 
     if (roomId) {
-      // Loss if they had guessed this game and it's not waiting
       try {
         const g = await Game.findOne({ roomId }).lean();
-        if (Array.isArray(game.playAgainUids)) {
-          game.playAgainUids = game.playAgainUids.filter((u) => u !== uid);
-        }
-        if (g && g.state !== "waiting" && userHasGuessedInGame(g, uid)) {
-          await UserStat.findOneAndUpdate(
-            { uid },
-            { $inc: { losses: 1, gamesPlayed: 1 } },
-            { upsert: true }
-          );
+        if (g) {
+          // Remove any outstanding "play again" vote from this uid
+          if (Array.isArray(g.playAgainUids) && g.playAgainUids.includes(uid)) {
+            await Game.updateOne({ _id: g._id }, { $pull: { playAgainUids: uid } });
+          }
+          // Loss if they had guessed this game and it's not waiting
+          if (g.state !== "waiting" && userHasGuessedInGame(g, uid)) {
+            await UserStat.findOneAndUpdate(
+              { uid },
+              { $inc: { losses: 1, gamesPlayed: 1 } },
+              { upsert: true }
+            );
+          }
         }
       } catch (_) { }
 
@@ -1168,6 +1282,6 @@ io.on("connection", (socket) => {
 
     socketState.delete(socket.id);
     await emitPublicRefresh();
-    emitMetrics(); // push updated online count
+    emitMetrics();
   });
 });
