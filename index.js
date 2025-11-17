@@ -875,13 +875,36 @@ io.on("connection", (socket) => {
   console.log("socket connected", socket.id);
 
   // Auth with Firebase ID token
+  // Auth with Firebase ID token
   socket.on("auth:hello", async ({ idToken }, cb) => {
     try {
       const decoded = await admin.auth().verifyIdToken(idToken);
       const uid = decoded.uid;
-      // Prefer claimed name in UserStat; fallback to first token from provider
-      const u = await UserStat.findOne({ uid }).select("displayName").lean();
-      const displayName = u?.displayName || nameFromDecoded(decoded);
+
+      // 1) Try UserStat first
+      let u = await UserStat.findOne({ uid }).select("displayName").lean();
+      let displayName = u?.displayName;
+
+      // 2) If missing, prefer Admin SDK profile (freshest)
+      if (!displayName) {
+        const fbUser = await admin.auth().getUser(uid);
+        if (fbUser?.displayName && fbUser.displayName.trim()) {
+          displayName = fbUser.displayName.trim();
+        }
+      }
+
+      // 3) If still missing, fall back to token name or email localpart
+      if (!displayName) {
+        displayName = nameFromDecoded(decoded);
+      }
+
+      // 4) Upsert into UserStat to persist
+      await UserStat.findOneAndUpdate(
+        { uid },
+        { $setOnInsert: { uid }, $set: { displayName } },
+        { upsert: true, new: true }
+      );
+
       socketState.set(socket.id, { uid, displayName, roomId: null, lastMsgAt: 0 });
 
       onlineUids.add(uid);
@@ -892,6 +915,7 @@ io.on("connection", (socket) => {
       cb?.({ ok: false, error: "Invalid auth" });
     }
   });
+
 
   // Create a room
   socket.on("room:create", async ({ maxPlayers, isPrivate, password }, cb) => {
